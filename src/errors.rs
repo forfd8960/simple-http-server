@@ -8,4 +8,7 @@ pub enum ServerError {
 
     #[error("server io error: {0}")]
     IOError(#[from] io::Error),
+
+    #[error("parse http err: {0}")]
+    HTTPParseError(#[from] httparse::Error),
 }
