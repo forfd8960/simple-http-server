@@ -83,7 +83,7 @@ impl HttpRequest {
         let mut headers = HashMap::new();
 
         for hdr in req.headers.iter().clone() {
-            headers.insert(hdr.name.to_string(), hdr.value.to_vec());
+            headers.insert(hdr.name.to_string().to_lowercase(), hdr.value.to_vec());
         }
 
         Self {
@@ -149,16 +149,13 @@ impl<'a> Server<'a> {
 }
 
 async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<(), ServerError> {
+    let mut conn_buf = BytesMut::with_capacity(4096);
+
     loop {
-        let mut req = read_request(stream, config).await?;
+        let (mut req, header_len) = read_request(stream, &mut conn_buf, config).await?;
         println!("received request: {}", req);
 
-        if req.is_body_over_limit(config.max_body_size) {
-            write_response(stream, HttpResponse::new_entity_too_large()).await?;
-            continue;
-        }
-
-        if let Some(content_length) = req.headers.get("Content-Length") {
+        if let Some(content_length) = req.headers.get("content-length") {
             let content_length = String::from_utf8_lossy(content_length)
                 .parse::<usize>()
                 .map_err(|e| {
@@ -170,68 +167,108 @@ async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<
 
             if content_length > config.max_body_size {
                 write_response(stream, HttpResponse::new_entity_too_large()).await?;
+                discard_current_request_body(stream, &mut conn_buf, header_len, content_length)
+                    .await?;
                 continue;
             }
 
-            let body = read_body(stream, content_length - req.body_len(), config).await?;
-            req.append_body(&body);
+            let total_needed = header_len + content_length;
+            ensure_buffer_len(stream, &mut conn_buf, total_needed).await?;
+
+            req.set_body(&conn_buf[header_len..total_needed]);
+            let _ = conn_buf.split_to(total_needed);
 
             println!("received body: {:?}", req.body);
+        } else {
+            req.set_body(&[]);
+            let _ = conn_buf.split_to(header_len);
         }
 
-        let resp = HttpResponse::new(200, HashMap::new(), Some(b"OK\r\n".to_vec()));
+        let resp = HttpResponse::new(200, HashMap::new(), Some(b"OK".to_vec()));
         write_response(stream, resp).await?;
     }
 }
 
-async fn read_request<R>(stream: &mut R, config: &ServerConfig) -> Result<HttpRequest, ServerError>
+async fn read_request<R>(
+    stream: &mut R,
+    conn_buf: &mut BytesMut,
+    config: &ServerConfig,
+) -> Result<(HttpRequest, usize), ServerError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = BytesMut::with_capacity(4096);
-
     loop {
-        let n_read = stream.read_buf(&mut buf).await?;
-        if n_read == 0 {
-            return Err(ServerError::IOError(UnexpectedEof.into()));
-        }
-
-        if buf.len() > config.max_header_size {
-            return Err(ServerError::ReqSizeExceedLimit(
-                "request size exceeds limit".to_string(),
-            ));
-        }
-
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
-        match req.parse(&buf)? {
+        match req.parse(conn_buf)? {
             Complete(n) => {
-                let mut request = HttpRequest::from_http_parse(&req);
-                request.set_body(&buf[n..]);
-                return Ok(request);
+                let request = HttpRequest::from_http_parse(&req);
+                return Ok((request, n));
             }
-            Partial => continue,
+            Partial => {
+                if conn_buf.len() > config.max_header_size {
+                    return Err(ServerError::ReqSizeExceedLimit(
+                        "request header size exceeds limit".to_string(),
+                    ));
+                }
+
+                let n_read = stream.read_buf(conn_buf).await?;
+                if n_read == 0 {
+                    return Err(ServerError::IOError(UnexpectedEof.into()));
+                }
+                continue;
+            }
         }
     }
 }
 
-async fn read_body<R>(
+async fn ensure_buffer_len<R>(
     stream: &mut R,
-    content_length: usize,
-    config: &ServerConfig,
-) -> Result<Vec<u8>, ServerError>
+    conn_buf: &mut BytesMut,
+    target_len: usize,
+) -> Result<(), ServerError>
 where
     R: AsyncRead + Unpin,
 {
-    if content_length > config.max_body_size {
-        return Err(ServerError::ReqSizeExceedLimit(
-            "request body size exceeds limit".to_string(),
-        ));
+    while conn_buf.len() < target_len {
+        let n_read = stream.read_buf(conn_buf).await?;
+        if n_read == 0 {
+            return Err(ServerError::IOError(UnexpectedEof.into()));
+        }
+    }
+    Ok(())
+}
+
+async fn discard_current_request_body<R>(
+    stream: &mut R,
+    conn_buf: &mut BytesMut,
+    header_len: usize,
+    content_length: usize,
+) -> Result<(), ServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let total_needed = header_len + content_length;
+    if conn_buf.len() >= total_needed {
+        let _ = conn_buf.split_to(total_needed);
+        return Ok(());
     }
 
-    let mut body = vec![0; content_length];
-    stream.read_exact(&mut body).await?;
-    Ok(body)
+    let already_buffered_body = conn_buf.len().saturating_sub(header_len);
+    let mut remaining = content_length.saturating_sub(already_buffered_body);
+    conn_buf.clear();
+
+    let mut scratch = [0u8; 4096];
+    while remaining > 0 {
+        let read_len = remaining.min(scratch.len());
+        let n_read = stream.read(&mut scratch[..read_len]).await?;
+        if n_read == 0 {
+            return Err(ServerError::IOError(UnexpectedEof.into()));
+        }
+        remaining -= n_read;
+    }
+
+    Ok(())
 }
 
 async fn write_response<W>(stream: &mut W, resp: HttpResponse) -> Result<(), ServerError>
@@ -263,14 +300,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::server::{ServerConfig, read_request};
+    use bytes::BytesMut;
+
+    use crate::server::{ServerConfig, ensure_buffer_len, read_request};
 
     #[test]
     fn test_read_request() {
         let req = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let mut stream = tokio_test::io::Builder::new().read(req).build();
-        let my_req = tokio_test::block_on(read_request(
+        let mut conn_buf = BytesMut::new();
+        let (my_req, _header_len) = tokio_test::block_on(read_request(
             &mut stream,
+            &mut conn_buf,
             &ServerConfig {
                 max_header_size: 8192,
                 max_body_size: 8192,
@@ -280,7 +321,67 @@ mod tests {
 
         assert_eq!(my_req.method, Some("GET".to_string()));
         assert_eq!(my_req.path, Some("/".to_string()));
-        assert_eq!(my_req.headers.get("Host").unwrap(), &b"localhost".to_vec());
-        assert_eq!(my_req.body, Some(vec![]));
+        assert_eq!(my_req.headers.get("host").unwrap(), &b"localhost".to_vec());
+        assert_eq!(my_req.body, None);
+    }
+
+    #[test]
+    fn test_read_request_pipelined_two_requests_in_one_packet() {
+        let req = b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\nGET /second HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut stream = tokio_test::io::Builder::new().read(req).build();
+        let mut conn_buf = BytesMut::new();
+        let cfg = ServerConfig {
+            max_header_size: 8192,
+            max_body_size: 8192,
+        };
+
+        let (req1, header_len1) =
+            tokio_test::block_on(read_request(&mut stream, &mut conn_buf, &cfg)).unwrap();
+
+        assert_eq!(req1.method, Some("GET".to_string()));
+        assert_eq!(req1.path, Some("/first".to_string()));
+        let _ = conn_buf.split_to(header_len1);
+
+        let (req2, _header_len2) =
+            tokio_test::block_on(read_request(&mut stream, &mut conn_buf, &cfg)).unwrap();
+
+        assert_eq!(req2.method, Some("GET".to_string()));
+        assert_eq!(req2.path, Some("/second".to_string()));
+    }
+
+    #[test]
+    fn test_read_request_pipelined_first_has_content_length_body() {
+        let req = b"POST /first HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nHELLOGET /second HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut stream = tokio_test::io::Builder::new().read(req).build();
+        let mut conn_buf = BytesMut::new();
+        let cfg = ServerConfig {
+            max_header_size: 8192,
+            max_body_size: 8192,
+        };
+
+        let (mut req1, header_len1) =
+            tokio_test::block_on(read_request(&mut stream, &mut conn_buf, &cfg)).unwrap();
+
+        let content_length1 = String::from_utf8_lossy(req1.headers.get("content-length").unwrap())
+            .parse::<usize>()
+            .unwrap();
+        let total_needed1 = header_len1 + content_length1;
+        tokio_test::block_on(ensure_buffer_len(&mut stream, &mut conn_buf, total_needed1)).unwrap();
+
+        assert!(conn_buf.len() >= total_needed1);
+
+        req1.set_body(&conn_buf[header_len1..total_needed1]);
+        let _ = conn_buf.split_to(total_needed1);
+
+        assert_eq!(req1.method, Some("POST".to_string()));
+        assert_eq!(req1.path, Some("/first".to_string()));
+        assert_eq!(req1.body, Some(b"HELLO".to_vec()));
+
+        let (req2, header_len2) =
+            tokio_test::block_on(read_request(&mut stream, &mut conn_buf, &cfg)).unwrap();
+        assert_eq!(req2.method, Some("GET".to_string()));
+        assert_eq!(req2.path, Some("/second".to_string()));
+
+        let _ = conn_buf.split_to(header_len2);
     }
 }
