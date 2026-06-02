@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io::ErrorKind::UnexpectedEof;
 
 use bytes::BytesMut;
 use httparse::Request;
@@ -24,6 +25,24 @@ pub struct HttpResponse {
     pub body: Option<Vec<u8>>,
 }
 
+impl HttpResponse {
+    pub fn new(status: u16, headers: HashMap<String, Vec<u8>>, body: Option<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    pub fn new_entity_too_large() -> Self {
+        Self {
+            status: 413,
+            headers: HashMap::new(),
+            body: Some(b"Request Entity Too Large\r\n".to_vec()),
+        }
+    }
+}
+
 impl Display for HttpRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -35,6 +54,31 @@ impl Display for HttpRequest {
 }
 
 impl HttpRequest {
+    pub fn new() -> Self {
+        Self {
+            method: None,
+            path: None,
+            headers: HashMap::new(),
+            body: None,
+        }
+    }
+
+    pub fn is_body_over_limit(&self, limit: usize) -> bool {
+        if let Some(body) = &self.body {
+            body.len() > limit
+        } else {
+            false
+        }
+    }
+
+    pub fn body_len(&self) -> usize {
+        if let Some(body) = &self.body {
+            body.len()
+        } else {
+            0
+        }
+    }
+
     pub fn from_http_parse(req: &Request<'_, '_>) -> Self {
         let mut headers = HashMap::new();
 
@@ -53,16 +97,31 @@ impl HttpRequest {
     pub fn set_body(&mut self, body: &[u8]) {
         self.body = Some(body.to_vec())
     }
+
+    pub fn append_body(&mut self, body: &[u8]) {
+        if let Some(existing_body) = &mut self.body {
+            existing_body.extend_from_slice(body);
+        } else {
+            self.body = Some(body.to_vec());
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub max_header_size: usize,
+    pub max_body_size: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct Server<'a> {
     pub addr: &'a str,
+    pub config: ServerConfig,
 }
 
 impl<'a> Server<'a> {
-    pub fn new(addr: &'a str) -> Self {
-        Self { addr }
+    pub fn new(addr: &'a str, config: ServerConfig) -> Self {
+        Self { addr, config }
     }
 
     pub async fn serve(&mut self) -> Result<(), ServerError> {
@@ -76,8 +135,9 @@ impl<'a> Server<'a> {
             let (mut stream, remote) = listener.accept().await?;
             println!("accept connection from: {}", remote);
 
+            let config = self.config.clone();
             tokio::spawn(async move {
-                match handle_stream(&mut stream).await {
+                match handle_stream(&mut stream, &config).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("failed handle stream for: {}, error: {:?}", remote, e);
@@ -88,20 +148,43 @@ impl<'a> Server<'a> {
     }
 }
 
-async fn handle_stream(stream: &mut TcpStream) -> Result<(), ServerError> {
+async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<(), ServerError> {
     loop {
-        let req = read_request(stream).await?;
+        let mut req = read_request(stream, config).await?;
         println!("received request: {}", req);
-        let resp = HttpResponse {
-            status: 200,
-            headers: HashMap::new(),
-            body: Some(b"OK\r\n".to_vec()),
-        };
+
+        if req.is_body_over_limit(config.max_body_size) {
+            write_response(stream, HttpResponse::new_entity_too_large()).await?;
+            continue;
+        }
+
+        if let Some(content_length) = req.headers.get("Content-Length") {
+            let content_length = String::from_utf8_lossy(content_length)
+                .parse::<usize>()
+                .map_err(|e| {
+                    ServerError::ParseHeaderValueFailed(format!(
+                        "failed parse Content-Length header value: {:?}, error: {}",
+                        content_length, e
+                    ))
+                })?;
+
+            if content_length > config.max_body_size {
+                write_response(stream, HttpResponse::new_entity_too_large()).await?;
+                continue;
+            }
+
+            let body = read_body(stream, content_length - req.body_len(), config).await?;
+            req.append_body(&body);
+
+            println!("received body: {:?}", req.body);
+        }
+
+        let resp = HttpResponse::new(200, HashMap::new(), Some(b"OK\r\n".to_vec()));
         write_response(stream, resp).await?;
     }
 }
 
-async fn read_request<R>(stream: &mut R) -> Result<HttpRequest, ServerError>
+async fn read_request<R>(stream: &mut R, config: &ServerConfig) -> Result<HttpRequest, ServerError>
 where
     R: AsyncRead + Unpin,
 {
@@ -110,20 +193,45 @@ where
     loop {
         let n_read = stream.read_buf(&mut buf).await?;
         if n_read == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            return Err(ServerError::IOError(UnexpectedEof.into()));
+        }
+
+        if buf.len() > config.max_header_size {
+            return Err(ServerError::ReqSizeExceedLimit(
+                "request size exceeds limit".to_string(),
+            ));
         }
 
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&buf)? {
             Complete(n) => {
-                let mut my_req = HttpRequest::from_http_parse(&req);
-                my_req.set_body(&buf[n..]);
-                return Ok(my_req);
+                let mut request = HttpRequest::from_http_parse(&req);
+                request.set_body(&buf[n..]);
+                return Ok(request);
             }
             Partial => continue,
         }
     }
+}
+
+async fn read_body<R>(
+    stream: &mut R,
+    content_length: usize,
+    config: &ServerConfig,
+) -> Result<Vec<u8>, ServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    if content_length > config.max_body_size {
+        return Err(ServerError::ReqSizeExceedLimit(
+            "request body size exceeds limit".to_string(),
+        ));
+    }
+
+    let mut body = vec![0; content_length];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
 }
 
 async fn write_response<W>(stream: &mut W, resp: HttpResponse) -> Result<(), ServerError>
@@ -155,13 +263,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::server::read_request;
+    use crate::server::{ServerConfig, read_request};
 
     #[test]
     fn test_read_request() {
         let req = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let mut stream = tokio_test::io::Builder::new().read(req).build();
-        let my_req = tokio_test::block_on(read_request(&mut stream)).unwrap();
+        let my_req = tokio_test::block_on(read_request(
+            &mut stream,
+            &ServerConfig {
+                max_header_size: 8192,
+                max_body_size: 8192,
+            },
+        ))
+        .unwrap();
 
         assert_eq!(my_req.method, Some("GET".to_string()));
         assert_eq!(my_req.path, Some("/".to_string()));

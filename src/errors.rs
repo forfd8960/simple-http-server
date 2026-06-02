@@ -11,4 +11,10 @@ pub enum ServerError {
 
     #[error("parse http err: {0}")]
     HTTPParseError(#[from] httparse::Error),
+
+    #[error("request size exceeds limit: {0}")]
+    ReqSizeExceedLimit(String),
+
+    #[error("parse header value error: {0}")]
+    ParseHeaderValueFailed(String),
 }
