@@ -34,6 +34,14 @@ impl HttpResponse {
         }
     }
 
+    pub fn new_bad_request(message: &str) -> Self {
+        Self {
+            status: 400,
+            headers: HashMap::new(),
+            body: Some(format!("Bad Request: {}\r\n", message).into_bytes()),
+        }
+    }
+
     pub fn new_entity_too_large() -> Self {
         Self {
             status: 413,
@@ -155,38 +163,55 @@ async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<
         let (mut req, header_len) = read_request(stream, &mut conn_buf, config).await?;
         println!("received request: {}", req);
 
-        if let Some(content_length) = req.headers.get("content-length") {
-            let content_length = String::from_utf8_lossy(content_length)
-                .parse::<usize>()
-                .map_err(|e| {
-                    ServerError::ParseHeaderValueFailed(format!(
-                        "failed parse Content-Length header value: {:?}, error: {}",
-                        content_length, e
-                    ))
-                })?;
-
-            if content_length > config.max_body_size {
-                write_response(stream, HttpResponse::new_entity_too_large()).await?;
-                discard_current_request_body(stream, &mut conn_buf, header_len, content_length)
-                    .await?;
-                continue;
-            }
-
-            let total_needed = header_len + content_length;
-            ensure_buffer_len(stream, &mut conn_buf, total_needed).await?;
-
-            req.set_body(&conn_buf[header_len..total_needed]);
-            let _ = conn_buf.split_to(total_needed);
-
-            println!("received body: {:?}", req.body);
-        } else {
-            req.set_body(&[]);
-            let _ = conn_buf.split_to(header_len);
-        }
+        handle_content(stream, &mut conn_buf, header_len, &mut req, config).await?;
 
         let resp = HttpResponse::new(200, HashMap::new(), Some(b"OK".to_vec()));
         write_response(stream, resp).await?;
     }
+}
+
+async fn handle_content(
+    stream: &mut TcpStream,
+    conn_buf: &mut BytesMut,
+    header_len: usize,
+    req: &mut HttpRequest,
+    config: &ServerConfig,
+) -> Result<(), ServerError> {
+    let c_l = req.headers.get("content-length");
+    if c_l.is_none() {
+        req.set_body(&[]);
+        let _ = conn_buf.split_to(header_len);
+        return Ok(());
+    }
+
+    let len_bs = c_l.unwrap();
+    let content_length = match String::from_utf8_lossy(len_bs).parse::<usize>() {
+        Ok(len) => len,
+        Err(_) => {
+            write_response(
+                stream,
+                HttpResponse::new_bad_request("invalid Content-Length header value"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if content_length > config.max_body_size {
+        write_response(stream, HttpResponse::new_entity_too_large()).await?;
+        discard_current_request_body(stream, conn_buf, header_len, content_length).await?;
+        return Ok(());
+    }
+
+    let total_needed = header_len + content_length;
+    ensure_buffer_len(stream, conn_buf, total_needed).await?;
+
+    req.set_body(&conn_buf[header_len..total_needed]);
+    let _ = conn_buf.split_to(total_needed);
+
+    println!("received body: {:?}", req.body);
+
+    Ok(())
 }
 
 async fn read_request<R>(
