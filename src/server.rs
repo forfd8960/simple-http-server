@@ -1,119 +1,14 @@
-use std::collections::HashMap;
-use std::fmt::Display;
 use std::io::ErrorKind::UnexpectedEof;
+use std::sync::Arc;
 
 use bytes::BytesMut;
-use httparse::Request;
 use httparse::Status::{Complete, Partial};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::errors::ServerError;
-
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: Option<String>,
-    pub path: Option<String>,
-    pub headers: HashMap<String, Vec<u8>>,
-    pub body: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: HashMap<String, Vec<u8>>,
-    pub body: Option<Vec<u8>>,
-}
-
-impl HttpResponse {
-    pub fn new(status: u16, headers: HashMap<String, Vec<u8>>, body: Option<Vec<u8>>) -> Self {
-        Self {
-            status,
-            headers,
-            body,
-        }
-    }
-
-    pub fn new_bad_request(message: &str) -> Self {
-        Self {
-            status: 400,
-            headers: HashMap::new(),
-            body: Some(format!("Bad Request: {}\r\n", message).into_bytes()),
-        }
-    }
-
-    pub fn new_entity_too_large() -> Self {
-        Self {
-            status: 413,
-            headers: HashMap::new(),
-            body: Some(b"Request Entity Too Large\r\n".to_vec()),
-        }
-    }
-}
-
-impl Display for HttpRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "HttpRequest {{ method: {:?}, path: {:?}, headers: {:?}, body: {:?} }}",
-            self.method, self.path, self.headers, self.body
-        )
-    }
-}
-
-impl HttpRequest {
-    pub fn new() -> Self {
-        Self {
-            method: None,
-            path: None,
-            headers: HashMap::new(),
-            body: None,
-        }
-    }
-
-    pub fn is_body_over_limit(&self, limit: usize) -> bool {
-        if let Some(body) = &self.body {
-            body.len() > limit
-        } else {
-            false
-        }
-    }
-
-    pub fn body_len(&self) -> usize {
-        if let Some(body) = &self.body {
-            body.len()
-        } else {
-            0
-        }
-    }
-
-    pub fn from_http_parse(req: &Request<'_, '_>) -> Self {
-        let mut headers = HashMap::new();
-
-        for hdr in req.headers.iter().clone() {
-            headers.insert(hdr.name.to_string().to_lowercase(), hdr.value.to_vec());
-        }
-
-        Self {
-            method: req.method.map(str::to_string),
-            path: req.path.map(str::to_string),
-            headers: headers,
-            body: None,
-        }
-    }
-
-    pub fn set_body(&mut self, body: &[u8]) {
-        self.body = Some(body.to_vec())
-    }
-
-    pub fn append_body(&mut self, body: &[u8]) {
-        if let Some(existing_body) = &mut self.body {
-            existing_body.extend_from_slice(body);
-        } else {
-            self.body = Some(body.to_vec());
-        }
-    }
-}
+use crate::req_res::{HttpRequest, HttpResponse};
+use crate::router::Router;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -132,7 +27,7 @@ impl<'a> Server<'a> {
         Self { addr, config }
     }
 
-    pub async fn serve(&mut self) -> Result<(), ServerError> {
+    pub async fn serve(&mut self, router: Arc<Router>) -> Result<(), ServerError> {
         println!("Server start serve on {}...", self.addr);
 
         let listener = TcpListener::bind(self.addr)
@@ -144,8 +39,9 @@ impl<'a> Server<'a> {
             println!("accept connection from: {}", remote);
 
             let config = self.config.clone();
+            let router_inner = router.clone();
             tokio::spawn(async move {
-                match handle_stream(&mut stream, &config).await {
+                match handle_stream(&mut stream, &config, &router_inner).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("failed handle stream for: {}, error: {:?}", remote, e);
@@ -156,7 +52,11 @@ impl<'a> Server<'a> {
     }
 }
 
-async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<(), ServerError> {
+async fn handle_stream(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    router: &Router,
+) -> Result<(), ServerError> {
     let mut conn_buf = BytesMut::with_capacity(4096);
 
     loop {
@@ -165,7 +65,7 @@ async fn handle_stream(stream: &mut TcpStream, config: &ServerConfig) -> Result<
 
         handle_content(stream, &mut conn_buf, header_len, &mut req, config).await?;
 
-        let resp = HttpResponse::new(200, HashMap::new(), Some(b"OK".to_vec()));
+        let resp = router.route(req).await;
         write_response(stream, resp).await?;
     }
 }
