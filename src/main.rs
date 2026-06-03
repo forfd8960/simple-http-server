@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use simple_http_server::{
-    req_res::HttpResponse,
+    req_res::{HttpRequest, HttpResponse},
     router::Router,
     server::{Server, ServerConfig},
 };
@@ -24,6 +24,8 @@ async fn main() {
         HttpResponse::new(200, None, Some(b"Home".to_vec()))
     });
 
+    router.get("/hello", hello);
+
     // Route with single parameter
     router.get("/api/users/:id", |req| async move {
         let user_id = req.param("id").unwrap_or("unknown");
@@ -44,4 +46,9 @@ async fn main() {
     if let Err(e) = server.serve(r).await {
         eprintln!("server error: {:?}", e);
     }
+}
+
+async fn hello(req: HttpRequest) -> HttpResponse {
+    println!("receive request from: {:?}", req.path);
+    HttpResponse::new(200, None, Some(b"Hello, HTTP".to_vec()))
 }

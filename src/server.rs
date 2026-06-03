@@ -123,7 +123,7 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(conn_buf)? {
             Complete(n) => {
@@ -181,6 +181,7 @@ where
 
     let already_buffered_body = conn_buf.len().saturating_sub(header_len);
     let mut remaining = content_length.saturating_sub(already_buffered_body);
+
     conn_buf.clear();
 
     let mut scratch = [0u8; 4096];
